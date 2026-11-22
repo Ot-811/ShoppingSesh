@@ -115,6 +115,7 @@ static std::vector<MFile> map_dir(const std::string& dir) {
         close(fd);
         if (m == MAP_FAILED) die("mmap failed");
         madvise(m, st.st_size, MADV_SEQUENTIAL);
+        madvise(m, st.st_size, MADV_WILLNEED);
         out.push_back({(const char*)m, (size_t)st.st_size});
     }
     return out;
@@ -937,6 +938,8 @@ struct UserOut {
 struct W4 {
     std::vector<SessRec> E;
     std::vector<ClickRec> C;
+    std::vector<SessRec> tmpE;
+    std::vector<ClickRec> tmpC;
     std::vector<Acc> acc;
     std::vector<u32> cnt, since;
     std::vector<i64> sstart, srev;
@@ -947,16 +950,47 @@ struct W4 {
     UserOut uo;
 };
 
+
+// Sort by (key, ts): one counting pass on 12 key bits (keys are hashes), then small local sorts.
+template <class T>
+static void sort_key_ts(std::vector<T>& v, std::vector<T>& tmp) {
+    const size_t n = v.size();
+    auto less = [](const T& a, const T& b) { return a.key != b.key ? a.key < b.key : a.ts < b.ts; };
+    if (n < 64) {
+        std::sort(v.begin(), v.end(), less);
+        return;
+    }
+    const int SH = 64 - PBITS - 12;
+    static thread_local std::vector<u32> hist;
+    hist.assign(4097, 0);
+    for (size_t i = 0; i < n; i++) hist[((v[i].key >> SH) & 4095) + 1]++;
+    for (int i = 0; i < 4096; i++) hist[i + 1] += hist[i];
+    tmp.resize(n);
+    static thread_local std::vector<u32> pos;
+    pos.assign(hist.begin(), hist.end() - 1);
+    for (size_t i = 0; i < n; i++) tmp[pos[(v[i].key >> SH) & 4095]++] = v[i];
+    for (int b = 0; b < 4096; b++) {
+        size_t lo = hist[b], hi = hist[b + 1];
+        if (hi - lo > 24) {
+            std::sort(tmp.begin() + lo, tmp.begin() + hi, less);
+        } else {
+            for (size_t i = lo + 1; i < hi; i++) {
+                T x = tmp[i];
+                size_t j = i;
+                while (j > lo && less(x, tmp[j - 1])) { tmp[j] = tmp[j - 1]; j--; }
+                tmp[j] = x;
+            }
+        }
+    }
+    v.swap(tmp);
+}
+
 static void process_partition(W4& w, size_t ncamp) {
     std::vector<SessRec>& E = w.E;
     std::vector<ClickRec>& C = w.C;
     if (E.empty()) return;
-    std::sort(E.begin(), E.end(), [](const SessRec& a, const SessRec& b) {
-        return a.key != b.key ? a.key < b.key : a.ts < b.ts;
-    });
-    std::sort(C.begin(), C.end(), [](const ClickRec& a, const ClickRec& b) {
-        return a.key != b.key ? a.key < b.key : a.ts < b.ts;
-    });
+    sort_key_ts(E, w.tmpE);
+    sort_key_ts(C, w.tmpC);
     const size_t ORG = ncamp;
     size_t ci = 0;
     size_t a = 0;
