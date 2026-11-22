@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <immintrin.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -166,6 +167,94 @@ static inline void for_lines(const Chunk& c, F&& fn) {
         fn(p, e);
         if (!nl) break;
         p = nl + 1;
+    }
+}
+
+
+// Fused newline + field scan (AVX2): calls fn(SV* fields) for every well-formed line with N fields.
+template <int N, class F>
+static inline void for_lines_fast(const Chunk& c, F&& fn) {
+    const char* base = c.base;
+    const char* fend = base + c.size;
+    const char* p;
+    if (c.lo == 0) {
+        const char* nl = (const char*)memchr(base, '\n', c.size);
+        if (!nl) return;
+        p = nl + 1;
+    } else if (base[c.lo - 1] == '\n') {
+        p = base + c.lo;
+    } else {
+        const char* nl = (const char*)memchr(base + c.lo, '\n', c.size - c.lo);
+        if (!nl) return;
+        p = nl + 1;
+    }
+    const char* hi = base + c.hi;
+    const __m256i vc = _mm256_set1_epi8(','), vn = _mm256_set1_epi8('\n'), vq = _mm256_set1_epi8('"');
+    while (p < hi) {
+        SV out[N];
+        int k = 0, q = 0;
+        const char* fs = p;
+        const char* x = p;
+        const char* next = nullptr;
+        bool ok = true;
+        // close the field ending at d; returns false if the line is malformed
+        auto close = [&](const char* d) -> bool {
+            if (k >= N) return false;
+            size_t len = (size_t)(d - fs);
+            if (q) {
+                if (q != 2 || len < 2 || fs[0] != '"' || d[-1] != '"') return false;
+                out[k] = {fs + 1, len - 2};
+            } else {
+                out[k] = {fs, len};
+            }
+            k++;
+            q = 0;
+            fs = d + 1;
+            return true;
+        };
+        while (!next) {
+            if (x + 32 <= fend) {
+                __m256i v = _mm256_loadu_si256((const __m256i*)x);
+                u32 m = (u32)_mm256_movemask_epi8(_mm256_or_si256(
+                    _mm256_or_si256(_mm256_cmpeq_epi8(v, vc), _mm256_cmpeq_epi8(v, vn)), _mm256_cmpeq_epi8(v, vq)));
+                while (m) {
+                    const char* d = x + __builtin_ctz(m);
+                    m &= m - 1;
+                    char ch = *d;
+                    if (ch == '"') { q++; continue; }
+                    if (!close(d)) {
+                        ok = false;
+                        if (ch == '\n') { next = d + 1; }
+                        else {
+                            const char* nl = (const char*)memchr(d, '\n', fend - d);
+                            next = nl ? nl + 1 : fend;
+                        }
+                        break;
+                    }
+                    if (ch == '\n') { next = d + 1; break; }
+                }
+                x += 32;
+            } else {
+                for (; x < fend; x++) {
+                    char ch = *x;
+                    if (ch == '"') { q++; continue; }
+                    if (ch != ',' && ch != '\n') continue;
+                    if (!close(x)) {
+                        ok = false;
+                        const char* nl = (const char*)memchr(x, '\n', fend - x);
+                        next = nl ? nl + 1 : fend;
+                        break;
+                    }
+                    if (ch == '\n') { next = x + 1; break; }
+                }
+                if (!next) {  // end of file without newline: last field
+                    if (!close(fend)) ok = false;
+                    next = fend;
+                }
+            }
+        }
+        if (ok && k == N) fn(out);
+        p = next;
     }
 }
 
@@ -542,9 +631,7 @@ static inline u32 enc_type(const SV& t, bool& ok) {
 }
 
 static void phase1_chunk(const Chunk& c, P1State& st) {
-    for_lines(c, [&](const char* s, const char* e) {
-        SV f[7];
-        if (!split_line(s, e, 7, f)) return;
+    for_lines_fast<7>(c, [&](const SV* f) {
         if (f[0].n == 0) return;
         EvRec r;
         r.eh = hash_bytes(f[0].p, f[0].n);
@@ -615,9 +702,7 @@ static inline void resolve_person(u64 uh, u64 upl, u64& key, u64& npl) {
 
 static void phase2_chunk(const Chunk& c, P2State& st) {
     const i64 lo = WS - 7 * MS_DAY;
-    for_lines(c, [&](const char* s, const char* e) {
-        SV f[4];
-        if (!split_line(s, e, 4, f)) return;
+    for_lines_fast<4>(c, [&](const SV* f) {
         if (f[0].n == 0 || f[1].n == 0) return;
         i64 ts;
         if (!parse_ts(f[3].p, f[3].n, ts) || ts < lo || ts >= WE) return;
